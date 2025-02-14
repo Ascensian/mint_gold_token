@@ -2,17 +2,16 @@
 pragma solidity 0.8.20;
 
 /**
- * @title DeployGoldBToken
+ * @title DeployGoldToken
  * @notice Script de déploiement du contrat GoldBackedToken avec Foundry.
  *
  * Pour exécuter le déploiement (sans broadcast):
- *    forge script script/DeployGoldBackedToken.s.sol:DeployGoldBackedToken \
- *      --rpc-url $RPC_URL \
+ *    forge script script/GoldToken.s.sol:DeployGoldToken \
+ *      --rpc-url https://eth-sepolia.g.alchemy.com/v2/yn5r7HYQ2Nue5VNatnlauYywMOTTDeKc \
  *      --private-key $PRIVATE_KEY \
  *      --broadcast
  *
  */
-
 import "forge-std/Script.sol";
 import "../src/GoldToken.sol";
 
@@ -30,7 +29,28 @@ contract DeployGoldToken is Script {
             ETH_USD_FEED_MAINNET
         );
 
-        console.log("GoldToken deployed at:", address(goldToken));
+        console.log("------------------------------------------------");
+        console.log(" Contrat GoldToken deployed at :");
+        console.logAddress(address(goldToken));
+        console.log("------------------------------------------------\n");
+
+        console.log("=== MINT : Envoi de 0.5 ETH a mintGold() ===");
+        goldToken.mintGold{value: 0.5 ether}();
+
+        uint256 balanceAfterMint = goldToken.balanceOf(msg.sender);
+        console.log("Balance GBT (msg.sender) apres mint:", balanceAfterMint);
+        console.log('En format "token":', balanceAfterMint / 1e18, "GBT");
+        console.log("------------------------------------------------\n");
+
+        uint256 halfTokens = balanceAfterMint / 2;
+        console.log("=== BURN : On brule la moitie des tokens recus ===");
+        console.log("Amount to burn (wei of token):", halfTokens);
+        goldToken.burnGold(halfTokens);
+
+        uint256 balanceAfterBurn = goldToken.balanceOf(msg.sender);
+        console.log("Balance GBT (msg.sender) apres burn:", balanceAfterBurn);
+        console.log('En format "token":', balanceAfterBurn / 1e18, "GBT");
+        console.log("------------------------------------------------\n");
 
         vm.stopBroadcast();
     }
