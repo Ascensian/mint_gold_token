@@ -4,15 +4,21 @@ pragma solidity 0.8.20;
 /**
  * @title GoldToken
  * @author
- * @notice Un token ERC20 adossé au prix de l'or via Chainlink.
- *
+ * @notice Un token ERC20 adossé au prix de l'or via Chainlink,
+ *         avec une loterie via Chainlink VRF.
  */
 
 import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract GoldToken is ERC20, Ownable {
+// Chainlink Price Feeds
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+// Chainlink VRF v2
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
+
+contract GoldToken is ERC20, Ownable, VRFConsumerBaseV2 {
     // ====================================================
     // ===================== Variables =====================
     // ====================================================
@@ -21,56 +27,91 @@ contract GoldToken is ERC20, Ownable {
     AggregatorV3Interface public ethPriceFeed;
     uint256 public constant FEE_PERCENT = 5;
 
-    /// @dev On choisit 18 décimales comme la plupart des tokens ERC20
+    // On choisit 18 décimales comme la plupart des tokens ERC20
     uint8 private constant DECIMALS = 18;
+
+    // ---------------------
+    // Variables VRF & Loterie
+    // ---------------------
+    VRFCoordinatorV2Interface private COORDINATOR;
+
+    /// @notice Subscription ID pour Chainlink VRF
+    uint64 private s_subscriptionId;
+
+    /// @notice keyHash du job VRF sur le network
+    bytes32 private s_keyHash;
+
+    /**
+     * @dev Pot de la loterie (en ETH).
+     *  On alimente ce pot avec 50 % des frais prélevés.
+     */
+    uint256 public lotteryPot;
+
+    /**
+     * @dev On stocke la dernière adresse qui a fait un mint/burn.
+     *  (Logique simple : si randomNumber % 2 == 0, elle gagne la loterie.)
+     */
+    address public lastParticipant;
 
     // ====================================================
     // ===================== Events ========================
     // ====================================================
-    /**
-     * @notice Émis lorsqu'un utilisateur mint des tokens et envoie de l'ETH
-     * @param sender L'adresse qui a mint
-     * @param ethAmount La quantité d'ETH envoyée (en wei)
-     * @param tokenAmount La quantité finale de tokens reçus
-     */
     event Mint(address indexed sender, uint256 ethAmount, uint256 tokenAmount);
-
-    /**
-     * @notice Émis lorsqu'un utilisateur burn des tokens et reçoit de l'ETH
-     * @param sender L'adresse qui a burn
-     * @param tokenAmount La quantité de tokens burn
-     * @param ethReturned La quantité d'ETH renvoyée (en wei) après frais
-     */
-    event Burn(
-        address indexed sender,
-        uint256 tokenAmount,
-        uint256 ethReturned
-    );
+    event Burn(address indexed sender, uint256 tokenAmount, uint256 ethReturned);
+    event LotteryWon(address indexed winner, uint256 amount);
 
     // ====================================================
     // ==================== Constructor ====================
     // ====================================================
     /**
-     * @notice Initialise le contrat ERC20 et fixe les oracles Chainlink.
+     * @notice Initialise le contrat ERC20, fixe les oracles Chainlink,
+     *         et définit l'adresse du VRF Coordinator (obligatoire
+     *         pour l'immutable dans VRFConsumerBaseV2).
+     *
      * @param _goldPriceFeed Adresse du feed Chainlink XAU/USD
      * @param _ethPriceFeed Adresse du feed Chainlink ETH/USD
+     * @param _vrfCoordinator Adresse du VRFCoordinator sur le réseau
      */
     constructor(
         address _goldPriceFeed,
-        address _ethPriceFeed
-    ) ERC20("Gold Backed Token", "GBT") Ownable(msg.sender) {
+        address _ethPriceFeed,
+        address _vrfCoordinator
+    )
+        ERC20("Gold Backed Token", "GBT")
+        Ownable(msg.sender)             // On garde Ownable(msg.sender)
+        VRFConsumerBaseV2(_vrfCoordinator) // On fixe l'adresse du coordinator ici
+    {
         goldPriceFeed = AggregatorV3Interface(_goldPriceFeed);
         ethPriceFeed = AggregatorV3Interface(_ethPriceFeed);
+
+        // Optionnel, on peut init "vide"
+        // s_subscriptionId = 0;
+        // s_keyHash = 0;
+        // On pourra les setter plus tard via setVRFParams(...)
+        
+        // On initialise COORDINATOR (qu'on utilisera pour requestRandomWords)
+        COORDINATOR = VRFCoordinatorV2Interface(_vrfCoordinator);
+    }
+
+    // ====================================================
+    // =================== VRF Settings ====================
+    // ====================================================
+    /**
+     * @notice Permet au owner de configurer la souscription et le keyHash du VRF.
+     * @param _subId L'ID de la souscription Chainlink
+     * @param _keyHash Le keyHash du job VRF à utiliser
+     */
+    function setVRFParams(uint64 _subId, bytes32 _keyHash)
+        external
+        onlyOwner
+    {
+        s_subscriptionId = _subId;
+        s_keyHash = _keyHash;
     }
 
     // ====================================================
     // =================== ERC20 Setup =====================
     // ====================================================
-
-    /**
-     * @notice Redéfinition éventuelle si on veut forcer 18 décimales
-     * @return Nombre de décimales du token
-     */
     function decimals() public pure override returns (uint8) {
         return DECIMALS;
     }
@@ -78,29 +119,11 @@ contract GoldToken is ERC20, Ownable {
     // ====================================================
     // ================== Chainlink Getters ===============
     // ====================================================
-
-    /**
-     * @notice Récupère le prix de l'or (XAU) en USD depuis Chainlink
-     * @dev Le feed XAU/USD a typiquement 8 décimales
-     * @return price Le prix de l'or en USD (avec 8 décimales)
-     */
     function getLatestGoldPrice() public view returns (int256) {
-        (
-            ,
-            /*uint80 roundId*/
-            int256 price /*uint startedAt*/ /*uint timeStamp*/ /*uint80 answeredInRound*/,
-            ,
-            ,
-
-        ) = goldPriceFeed.latestRoundData();
+        (, int256 price, , , ) = goldPriceFeed.latestRoundData();
         return price;
     }
 
-    /**
-     * @notice Récupère le prix de l'ETH en USD depuis Chainlink
-     * @dev Le feed ETH/USD a typiquement 8 décimales
-     * @return price Le prix de l'ETH en USD (avec 8 décimales)
-     */
     function getLatestEthPrice() public view returns (int256) {
         (, int256 price, , , ) = ethPriceFeed.latestRoundData();
         return price;
@@ -109,12 +132,6 @@ contract GoldToken is ERC20, Ownable {
     // ====================================================
     // ====================== Mint =========================
     // ====================================================
-    /**
-     * @notice Permet de frapper (mint) des tokens en échange d'ETH.
-     * @dev  L'utilisateur envoie de l'ETH, on calcule la quantité de GBT
-     *       en se basant sur les prix XAU/USD et ETH/USD. 1 GBT = 1 gramme.
-     *       On applique 5% de frais (non remis à l'utilisateur).
-     */
     function mintGold() external payable {
         require(msg.value > 0, "No ETH sent");
 
@@ -126,13 +143,22 @@ contract GoldToken is ERC20, Ownable {
         uint256 ethPriceUint = uint256(ethPrice); // 8 dec
         uint256 goldPriceUint = uint256(goldPrice); // 8 dec
 
-        uint256 usdValue = (msg.value * ethPriceUint) / 1e26;
+                uint256 usdValue = (msg.value * ethPriceUint) / 1e26;
 
-        uint256 gramsOfGoldIn1e18 = (usdValue * 1e26) / goldPriceUint;
+                uint256 gramsOfGoldIn1e18 = (usdValue * 1e26) / goldPriceUint;
 
+        // 5% de frais => 95% pour l'utilisateur
         uint256 fee = (gramsOfGoldIn1e18 * FEE_PERCENT) / 100;
         uint256 netMintAmount = gramsOfGoldIn1e18 - fee;
 
+        // On injecte 50% de la valeur en ETH de ce fee dans la loterie
+        // 5% de l'ETH envoyé => (msg.value * 5/100)
+        uint256 feeInEth = (msg.value * FEE_PERCENT) / 100; 
+        uint256 halfFeeInEth = feeInEth / 2;
+        lotteryPot += halfFeeInEth;
+        lastParticipant = msg.sender;
+
+        // Mint pour l'utilisateur
         _mint(msg.sender, netMintAmount);
 
         emit Mint(msg.sender, msg.value, netMintAmount);
@@ -141,36 +167,40 @@ contract GoldToken is ERC20, Ownable {
     // ====================================================
     // ====================== Burn ========================
     // ====================================================
-    /**
-     * @notice Permet de brûler (burn) des tokens et de récupérer de l'ETH
-     * @dev  L'utilisateur rend ses tokens (1 GBT = 1 g) et reçoit l'équivalent
-     *       en ETH. 5% de frais sont déduits sur la valeur retournée.
-     * @param _amount Quantité de tokens à brûler (en 18 décimales)
-     */
     function burnGold(uint256 _amount) external {
         require(_amount > 0, "Amount must be > 0");
         require(balanceOf(msg.sender) >= _amount, "Not enough tokens");
 
-        // Prix XAU/USD
+// Prix XAU/USD
         int256 goldPrice = getLatestGoldPrice();
         require(goldPrice > 0, "Invalid gold price");
 
-        // Prix ETH/USD
+// Prix ETH/USD
         int256 ethPrice = getLatestEthPrice();
         require(ethPrice > 0, "Invalid ETH price");
 
         uint256 goldPriceUint = uint256(goldPrice);
         uint256 ethPriceUint = uint256(ethPrice);
 
+        // Convertit tokens -> USD
         uint256 usdValue = (_amount * goldPriceUint) / 1e26;
 
+        // Convertit USD -> ETH
         uint256 redemptionWei = (usdValue * 1e26) / ethPriceUint;
 
+        // 5% de frais
         uint256 fee = (redemptionWei * FEE_PERCENT) / 100;
         uint256 netEth = redemptionWei - fee;
 
+        // Burn tokens
         _burn(msg.sender, _amount);
 
+        // Ajout de la moitié des frais au pot de loterie
+        uint256 halfFee = fee / 2;
+        lotteryPot += halfFee;
+        lastParticipant = msg.sender;
+
+        // L'utilisateur reçoit le reste
         (bool success, ) = msg.sender.call{value: netEth}("");
         require(success, "ETH transfer failed");
 
@@ -178,16 +208,62 @@ contract GoldToken is ERC20, Ownable {
     }
 
     // ====================================================
-    // ====================== Owner =======================
+    // ================== Lottery Functions ===============
     // ====================================================
+    /**
+     * @notice Le owner déclenche la loterie pour générer un random.
+     */
+    function drawLottery() external onlyOwner returns (uint256 requestId) {
+        require(lotteryPot > 0, "No pot to win");
+        require(address(COORDINATOR) != address(0), "VRF not configured");
+
+        requestId = COORDINATOR.requestRandomWords(
+            s_keyHash,
+            s_subscriptionId,
+            3,          // requestConfirmations
+            200000,     // callbackGasLimit
+            1           // numWords
+        );
+    }
 
     /**
-     * @notice Le propriétaire peut retirer les frais collectés (ETH restant)
+     * @notice Callback de Chainlink VRF.
+     *         On verse la cagnotte à lastParticipant si random est pair.
+     */
+    function fulfillRandomWords(
+        uint256, 
+        uint256[] memory randomWords
+    ) internal override {
+        uint256 randomNumber = randomWords[0];
+
+        // Simple logique: 1 chance sur 2
+        if (randomNumber % 2 == 0) {
+            uint256 prize = lotteryPot;
+            lotteryPot = 0;
+
+            (bool success, ) = lastParticipant.call{value: prize}("");
+            require(success, "Lottery transfer failed");
+
+            emit LotteryWon(lastParticipant, prize);
+        }
+        // Sinon, rien. On laisse la loterie pour un prochain drawLottery().
+    }
+
+    // ====================================================
+    // ====================== Owner =======================
+    // ====================================================
+    /**
+     * @notice Retrait des frais par le owner (solde - pot).
      */
     function withdrawFees() external onlyOwner {
         uint256 balance = address(this).balance;
-        require(balance > 0, "No ETH to withdraw");
-        (bool success, ) = owner().call{value: balance}("");
+        // On retire tout sauf le pot de la loterie
+        uint256 available = balance - lotteryPot;
+        require(available > 0, "No ETH to withdraw");
+
+        (bool success, ) = owner().call{value: available}("");
         require(success, "Withdraw failed");
     }
+
+    receive() external payable {}
 }
