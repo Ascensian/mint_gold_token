@@ -57,9 +57,9 @@ contract DeployGoldToken is Script {
         // 3. Test de quelques appels
         ///////////////////////////////////////////
 
-        // MINT : Envoi de 0.5 ETH à mintGold()
-        console.log(unicode"=== MINT : Envoi de 0.5 ETH à mintGold() ===");
-        goldToken.mintGold{value: 0.5 ether}();
+        // MINT : Envoi de 0.001 ETH à mintGold()
+        console.log(unicode"=== MINT : Envoi de 0.001 ETH à mintGold() ===");
+        goldToken.mintGold{value: 0.001 ether}();
 
         uint256 balanceAfterMint = goldToken.balanceOf(msg.sender);
         console.log(unicode"Balance GBT (msg.sender) après mint:", balanceAfterMint);
